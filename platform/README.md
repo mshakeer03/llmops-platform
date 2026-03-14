@@ -58,13 +58,13 @@ The platform enforces a governance-first lifecycle. Every model must pass throug
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  STEP  │  ACTION                             │  STATUS (after)              │
 ├────────┼─────────────────────────────────────┼──────────────────────────────┤
-│   1    │  Download weights (HF Manager)       │  — (cached on disk)          │
-│   2    │  Register model                      │  pending                     │
-│   3    │  Request approval                    │  pending_approval            │
-│   4    │  Admin approves                      │  approved                    │
-│   5    │  Run evaluation harness              │  approved + last_eval_passed │
-│   6    │  Activate (PATCH status → active)    │  active ✓                    │
-│   7    │  Start vLLM engine                   │  engine: starting → running  │
+│   1    │  Download weights (HF Manager)      │  — (cached on disk)          │
+│   2    │  Register model                     │  pending                     │
+│   3    │  Request approval                   │  pending_approval            │
+│   4    │  Admin approves                     │  approved                    │
+│   5    │  Run evaluation harness             │  approved + last_eval_passed │
+│   6    │  Activate (PATCH status → active)   │  active ✓                    │
+│   7    │  Start vLLM engine                  │  engine: starting → running  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,11 +77,11 @@ The platform enforces a governance-first lifecycle. Every model must pass throug
 │  STEP  │  ACTION                             │  STATUS (after)              │
 ├────────┼─────────────────────────────────────┼──────────────────────────────┤
 │   7    │  Stop vLLM engine                   │  engine: stopped             │
-│   6    │  Retire model (PATCH → retired)      │  retired                     │
-│        │  (auto-handled by De-register if     │                              │
-│        │   no engines running)                │                              │
-│   5–2  │  De-register (soft-delete record)    │  deleted_at set, hidden      │
-│   1    │  Delete HF cache (free disk)         │  — (weights removed)         │
+│   6    │  Retire model (PATCH → retired)     │  retired                     │
+│        │  (auto-handled by De-register if    │                              │
+│        │   no engines running)               │                              │
+│   5–2  │  De-register (soft-delete record)   │  deleted_at set, hidden      │
+│   1    │  Delete HF cache (free disk)        │  — (weights removed)         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
