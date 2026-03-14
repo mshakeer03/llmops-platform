@@ -1,0 +1,123 @@
+# =============================================================================
+#  LLMOps Platform — Vector Log-Forwarding Configuration
+#  Phase 5.2.4
+#
+#  Vector (https://vector.dev) tails the platform containers' stdout,
+#  parses the structured JSON lines emitted by the API (Phase 5.2.3),
+#  and forwards them to a configurable sink.
+#
+#  Default behaviour
+#  -----------------
+#  • Reads  : Docker container stdout via the Docker socket.
+#  • Parses : Each line as JSON; falls back to raw string on parse failure.
+#  • Writes : Pretty-printed JSON to Vector's own stdout (console).
+#
+#  To forward to Elasticsearch or Splunk, uncomment the relevant sink block
+#  and set the corresponding environment variables in platform/.env.
+#
+#  Environment variables (set in platform/.env)
+#  --------------------------------------------
+#  VECTOR_LOG_LEVEL          Vector's own log verbosity (default: info)
+#
+#  Elasticsearch:
+#    ELASTICSEARCH_ENDPOINT   https://myelastic.example.com:9200
+#    ELASTICSEARCH_INDEX      llmops-logs
+#    ELASTICSEARCH_API_KEY    base64-encoded API key (optional)
+#
+#  Splunk HEC:
+#    SPLUNK_HEC_ENDPOINT      https://mysplunk.example.com:8088
+#    SPLUNK_HEC_TOKEN         your-splunk-hec-token
+#    SPLUNK_INDEX             llmops
+#
+#  Podman note
+#  -----------
+#  Replace the `docker_host` below with your Podman socket, e.g.:
+#    unix:///run/user/1000/podman/podman.sock     (rootless, Linux)
+#    unix:///tmp/podman.sock                      (after: podman machine inspect)
+#  Or run `podman system service --time=0 unix:///tmp/podman.sock &`
+# =============================================================================
+
+# ── Global options ─────────────────────────────────────────────────────────
+[api]
+  enabled    = true
+  address    = "0.0.0.0:8686"   # Vector's built-in HTTP API (metrics, health)
+
+# ── Sources ────────────────────────────────────────────────────────────────
+[sources.docker]
+  type        = "docker_logs"
+  # Only tail containers belonging to the llmops-platform compose project
+  include_labels = { "com.docker.compose.project" = "llmops-platform" }
+  docker_host = "${DOCKER_SOCKET:-unix:///var/run/docker.sock}"
+
+# ── Transforms ─────────────────────────────────────────────────────────────
+
+# 1. Parse each log line as JSON (structured logs from structlog).
+#    If the line is not valid JSON (e.g. a plain INFO line from a dependency),
+#    the original message is preserved under the `raw_message` key.
+[transforms.parse_json]
+  type   = "remap"
+  inputs = ["docker"]
+  source = '''
+  structured, err = parse_json(.message)
+  if err == null {
+    # Merge parsed fields into the root event
+    . = merge(., structured)
+    del(.message)
+  } else {
+    .raw_message = .message
+    .parse_error  = err
+  }
+
+  # Ensure a timestamp field exists at the top level
+  if !exists(.timestamp) {
+    .timestamp = .timestamp ?? now()
+  }
+
+  # Tag with the container name for downstream filtering
+  .service = .container_name ?? .container_id ?? "unknown"
+  '''
+
+# 2. Route: split llmops-api structured events from everything else.
+[transforms.route_by_service]
+  type   = "route"
+  inputs = ["parse_json"]
+
+  [transforms.route_by_service.route]
+    api    = '.service == "llmops-api"'
+    other  = '.service != "llmops-api"'
+
+# ── Sinks ──────────────────────────────────────────────────────────────────
+
+# ── Sink 1: Console (always active — useful for local debugging) ────────────
+[sinks.console_api]
+  type     = "console"
+  inputs   = ["route_by_service.api"]
+  encoding = { codec = "json" }
+
+[sinks.console_other]
+  type     = "console"
+  inputs   = ["route_by_service.other"]
+  encoding = { codec = "json" }
+
+# ── Sink 2: Elasticsearch — uncomment to enable ─────────────────────────────
+# [sinks.elasticsearch]
+#   type     = "elasticsearch"
+#   inputs   = ["route_by_service.api"]
+#   endpoint = "${ELASTICSEARCH_ENDPOINT}"
+#   index    = "${ELASTICSEARCH_INDEX:-llmops-logs-%Y.%m.%d}"
+#   auth.strategy = "api_key"
+#   auth.api_key  = "${ELASTICSEARCH_API_KEY:-}"
+#   encoding = { codec = "json" }
+#   bulk.action = "create"
+
+# ── Sink 3: Splunk HEC — uncomment to enable ─────────────────────────────────
+# [sinks.splunk_hec]
+#   type          = "splunk_hec_logs"
+#   inputs        = ["route_by_service.api"]
+#   endpoint      = "${SPLUNK_HEC_ENDPOINT}"
+#   token         = "${SPLUNK_HEC_TOKEN}"
+#   index         = "${SPLUNK_INDEX:-llmops}"
+#   source        = "llmops-platform"
+#   sourcetype    = "_json"
+#   default_token = "${SPLUNK_HEC_TOKEN}"
+#   encoding      = { codec = "json" }

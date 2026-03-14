@@ -1,0 +1,99 @@
+services:
+
+  api:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"   # 8000 is taken by mcp-gateway
+    environment:
+      DATABASE_URL: postgresql+asyncpg://llmops:llmops@db:5432/llmops
+      DEBUG: "true"
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-me}
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MLFLOW_ENABLED: "true"
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    volumes:
+      # Mount source for hot-reload in dev
+      - ../api:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: llmops
+      POSTGRES_PASSWORD: llmops
+      POSTGRES_DB: llmops
+    ports:
+      - "5433:5432"   # 5432 is taken by mcp-postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmops -d llmops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Phase 2.1 — MLflow Tracking Server ─────────────────────────────────────
+  # Port 5001: port 5000 is taken by AirPlay Receiver on macOS.
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.3
+    ports:
+      - "5001:5001"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow/mlflow.db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5001
+    volumes:
+      - mlflow-data:/mlflow
+    restart: unless-stopped
+
+  # ── Phase 2.4 — Prometheus ───────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+
+  # ── Phase 2.4 — Grafana ──────────────────────────────────────────────────────
+  # Port 3002: 3000 is reserved for React admin console (Phase 3), 3001 for mcp-hub-ui
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3002:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-llmops-dev}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mlflow-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,117 @@
+# =============================================================================
+#  LLMOps Platform — Prometheus Alert Rules
+#  Phase 5.2.2
+#
+#  Loaded by prometheus.yml via:
+#    rule_files:
+#      - /etc/prometheus/alert-rules.yml
+#
+#  All thresholds can be tuned by editing the `expr` values or adding a
+#  `for:` duration that matches your SLO.
+# =============================================================================
+
+groups:
+
+  # ── Engine availability ────────────────────────────────────────────────────
+  - name: llmops_engine_availability
+    interval: 30s
+    rules:
+
+      - alert: NoActiveEngines
+        expr: vllm_active_engines == 0
+        for: 2m
+        labels:
+          severity: warning
+          team: llmops
+        annotations:
+          summary: "No active vLLM engines"
+          description: >
+            vllm_active_engines has been 0 for more than 2 minutes.
+            No inference requests can be served.  Check the Engines tab or the
+            vLLM log for startup errors.
+
+      - alert: EngineQueueBackpressure
+        expr: sum(vllm_engine_requests_pending) > 10
+        for: 2m
+        labels:
+          severity: warning
+          team: llmops
+        annotations:
+          summary: "vLLM request queue depth > 10"
+          description: >
+            {{ $value | printf "%.0f" }} requests are pending across all vLLM
+            engines.  Consider starting additional engines or reducing request
+            concurrency.
+
+      - alert: HighKVCacheUsage
+        expr: max(vllm_engine_cache_usage_pct) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+          team: llmops
+        annotations:
+          summary: "KV-cache usage above 90 %"
+          description: >
+            At least one engine has KV-cache utilisation above 90 % for the
+            last 5 minutes (current: {{ $value | printf "%.1f%%" }}).
+            Long contexts may start failing with OOM errors.
+
+  # ── API reliability ─────────────────────────────────────────────────────────
+  - name: llmops_api_reliability
+    rules:
+
+      - alert: HighAPIErrorRate
+        expr: >
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          team: llmops
+        annotations:
+          summary: "API 5xx error rate above 5 %"
+          description: >
+            The platform API is returning more than 5 % HTTP 5xx responses
+            (current rate: {{ $value | humanizePercentage }}).
+            Check the API container logs for exceptions.
+
+      - alert: HighAPILatencyP99
+        expr: >
+          histogram_quantile(
+            0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 2m
+        labels:
+          severity: warning
+          team: llmops
+        annotations:
+          summary: "API P99 latency above 5 s"
+          description: >
+            The 99th percentile API response time has exceeded 5 seconds for
+            the last 2 minutes (current P99: {{ $value | humanizeDuration }}).
+
+  # ── Token / cost spikes ──────────────────────────────────────────────────────
+  - name: llmops_cost
+    rules:
+
+      - alert: TokenRateSpike
+        expr: >
+          (
+            sum(rate(vllm_tokens_generated_total[5m]))
+          )
+          /
+          (
+            sum(rate(vllm_tokens_generated_total[30m])) > 0
+          ) > 3
+        for: 5m
+        labels:
+          severity: warning
+          team: llmops
+        annotations:
+          summary: "Token generation rate 3× above 30-minute baseline"
+          description: >
+            The current token generation rate is more than 3× the 30-minute
+            rolling average, which may indicate a runaway client or prompt-
+            injection loop driving unexpected cost.
