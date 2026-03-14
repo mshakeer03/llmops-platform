@@ -1,0 +1,293 @@
+# =============================================================================
+#  LLMOps Platform — Consolidated Compose File
+#  Pod / project label: llmops-platform
+#
+#  Services
+#    db          PostgreSQL 16 — hosts TWO databases: llmops + litellm (port 5433)
+#    api         FastAPI platform backend (port 8001)
+#    ui          React Admin Console via nginx (port 3000)
+#    litellm     LiteLLM proxy + UI — DB-backed, manages deployments (port 4000)
+#    open-webui  OpenWebUI chat playground (port 5000)
+#    mlflow      MLflow tracking server (port 5001)
+#    prometheus  Metrics scraper (port 9090)
+#    grafana     Dashboards (port 3002)
+#
+#  Quick start
+#    cd platform
+#    cp .env.example .env            # set SECRET_KEY + LITELLM_MASTER_KEY
+#    podman-compose up --build -d    # or: docker compose up --build -d
+#
+#  First login
+#    Platform UI  → http://localhost:3000      admin@llmops.local / changeme
+  #    LiteLLM UI   → http://localhost:4000/ui   admin / llmops-admin  (or LITELLM_UI_PASSWORD)
+#    OpenWebUI    → http://localhost:5000       (create account on first visit)
+#
+#  NOTE: vLLM engine start from the UI sends a subprocess call.  For Docker
+#  deployments this runs inside the `api` container.  The container does NOT
+#  have vLLM installed, so engine-start will return an error until vLLM is
+#  added to the image or the API is run on the host.  All other UI features
+#  (auth, catalogue, approvals, routing, reports, audit) work fully in-container.
+# =============================================================================
+
+name: llmops-platform
+
+services:
+
+  # ── PostgreSQL — hosts both llmops and litellm databases ───────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: llmops-db
+    environment:
+      POSTGRES_USER:     llmops
+      POSTGRES_PASSWORD: llmops
+      POSTGRES_DB:       llmops      # primary DB; init script creates litellm DB too
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once on first volume creation — creates the litellm database
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U llmops -d llmops"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+    restart: unless-stopped
+
+  # ── Platform API (FastAPI + Alembic) ────────────────────────────────────────
+  api:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: llmops-api
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL:                 postgresql+asyncpg://llmops:llmops@db:5432/llmops
+      DEBUG:                        "true"
+      SECRET_KEY:                   ${SECRET_KEY:-dev-secret-change-in-production}
+      ALGORITHM:                    HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES:  "60"
+      # UI origin for CORS (nginx serves on 3000)
+      CORS_ORIGINS:                 '["http://localhost:3000","http://llmops-ui:3000"]'
+      # HuggingFace — cache mounted read-write to support model downloads from the UI
+      # The download endpoint temporarily disables offline mode for specific requests.
+      HF_HOME:                      /root/.cache/huggingface
+      HF_HUB_OFFLINE:               "false"
+      # Python executable inside container for vLLM engine launch (local mode only)
+      # NOTE: This is NOT used when LAUNCHER_URL is set below (which is the default setup).
+      # VLLM_PYTHON:                /root/.cache/vllm_env/bin/python
+      #
+      # Host-side launcher URL — the API delegates vLLM start/stop to this service
+      # instead of running subprocess.Popen inside the container. Required on macOS
+      # because the vLLM Metal/MPS backend only works on the host, not inside a container.
+      # Run: python3 platform/host-launcher/launcher.py  (before starting engines)
+      LAUNCHER_URL:                 http://host.containers.internal:9001
+      # LiteLLM integration (for token reporting)
+      LITELLM_URL:                  http://litellm:4000
+      LITELLM_MASTER_KEY:           ${LITELLM_MASTER_KEY:-sk-llmops-master-key-change-me}
+      DEFAULT_DTYPE:                bfloat16
+      DEFAULT_GPU_MEMORY_UTILIZATION: "0.5"
+      DEFAULT_HOST:                 "0.0.0.0"
+      # MLflow
+      MLFLOW_TRACKING_URI:          http://mlflow:5001
+      MLFLOW_ENABLED:               "true"
+      # Optional Slack/webhook alerts
+      WEBHOOK_URL:                  ${WEBHOOK_URL:-}
+      # First-run bootstrap admin account (created only if no admin exists)
+      SEED_ADMIN_EMAIL:             ${SEED_ADMIN_EMAIL:-admin@llmops.local}
+      SEED_ADMIN_PASSWORD:          ${SEED_ADMIN_PASSWORD:-changeme}
+    user: "0"    # run as root so the HF cache bind-mount (root-owned in Podman VM) is readable
+    extra_hosts:
+      # Reach vLLM engines running on the macOS host (Podman VM bridge)
+      - "host.containers.internal:host-gateway"
+    volumes:
+      # Expose host HF model cache into the container (read-write for downloads)
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:rw
+      # Always pull latest alembic migrations from host source (avoids stale image)
+      - ./api/alembic:/app/alembic:ro
+      # Live-sync app source so image rebuilds aren't needed for code changes
+      - ./api/app:/app/app:ro
+      # Shared log dir so host-spawned vLLM writes logs the container can tail
+      - /tmp/vllm_logs:/tmp/vllm_logs
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    # Run DB migrations before starting the server; --reload watches bind-mounted app/ source
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload"
+    restart: unless-stopped
+
+  # ── React Admin Console ─────────────────────────────────────────────────────
+  ui:
+    build:
+      context:    ./ui
+      dockerfile: Dockerfile
+    container_name: llmops-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── LiteLLM Proxy + UI (PostgreSQL-backed) ─────────────────────────────────
+  #
+  #  DATABASE_URL enables:
+  #    • LiteLLM UI at http://localhost:4000/ui  (admin / ${LITELLM_UI_PASSWORD:-llmops-admin})
+  #    • Models created in the UI persist across restarts
+  #    • Deployment admins can manage routes independently of the platform
+  #
+  #  vLLM engines run on the HOST — reachable via host.containers.internal
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: llmops-litellm
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL:         postgresql://llmops:llmops@db:5432/litellm
+      LITELLM_MASTER_KEY:   ${LITELLM_MASTER_KEY:-sk-llmops-master-key-change-me}
+      STORE_MODEL_IN_DB:    "True"
+      # Explicit UI credentials (required since LiteLLM v1.40+)
+      UI_USERNAME:          ${LITELLM_UI_USERNAME:-admin}
+      UI_PASSWORD:          ${LITELLM_UI_PASSWORD:-llmops-admin}
+      # Allow the platform UI and OpenWebUI to call the proxy
+      LITELLM_CORS_ORIGINS: "http://localhost:3000,http://localhost:5000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
+    extra_hosts:
+      # Reach vLLM engines running on the Mac host (Podman / Docker Desktop)
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── OpenWebUI — Chat Playground ─────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: llmops-open-webui
+    ports:
+      - "5000:8080"
+    environment:
+      OPENAI_API_BASE_URL:           http://litellm:4000/v1
+      OPENAI_API_KEY:                ${LITELLM_MASTER_KEY:-sk-llmops-master-key-change-me}
+      ENABLE_OLLAMA_API:             "False"
+      ENABLE_SIGNUP:                 "True"    # set False after creating admin in UI
+      DEFAULT_USER_ROLE:             "user"    # non-first users get 'user' role
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: ""
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - litellm
+    restart: unless-stopped
+
+  # ── MLflow Tracking Server ──────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.3
+    container_name: llmops-mlflow
+    ports:
+      - "5001:5001"
+    environment:
+      MLFLOW_BACKEND_STORE_URI:      sqlite:///mlflow/mlflow.db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT:  /mlflow/artifacts
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5001
+    volumes:
+      - mlflow-data:/mlflow
+    restart: unless-stopped
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: llmops-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro   # Phase 5.2.2
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: llmops-grafana
+    ports:
+      - "3002:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-llmops-dev}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ── Alertmanager — Phase 5.2.2 ──────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: llmops-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./infra/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--config.expand-env=true"  # expand ${VAR} references from .env
+      - "--web.external-url=http://localhost:9093"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ── Vector log-forwarding adapter — Phase 5.2.4 ─────────────────────────────
+  #
+  #  Opt-in: only starts when you pass --profile log-forwarding
+  #    podman-compose --profile log-forwarding up -d vector
+  #    docker compose   --profile log-forwarding up -d vector
+  #
+  #  Configuration at: platform/infra/vector.toml
+  #  Sink options: stdout (default), Elasticsearch, Splunk HEC
+  vector:
+    image: timberio/vector:0.40.0-alpine
+    container_name: llmops-vector
+    profiles:
+      - log-forwarding
+    ports:
+      - "8686:8686"   # Vector API / health
+    volumes:
+      - ./infra/vector.toml:/etc/vector/vector.toml:ro
+      # Mount the Docker socket so Vector can read container logs.
+      # Podman users: replace with your Podman socket path (see vector.toml).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      VECTOR_LOG: ${VECTOR_LOG_LEVEL:-info}
+    command: ["--config", "/etc/vector/vector.toml"]
+    depends_on:
+      - api
+    restart: unless-stopped
+
+# =============================================================================
+volumes:
+  postgres-data:
+  mlflow-data:
+  prometheus-data:
+  grafana-data:
+  open-webui-data:
+  alertmanager-data:    # Phase 5.2.2

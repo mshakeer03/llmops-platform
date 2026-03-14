@@ -1,0 +1,42 @@
+# =============================================================================
+#  LiteLLM Proxy — Initial Seed Configuration (platform/litellm-config.yaml)
+#
+#  This file is the STATIC SEED loaded on first start.
+#  Once LiteLLM has a PostgreSQL backend (DATABASE_URL set), any models added
+#  or updated via the LiteLLM UI (http://localhost:4000/ui) are persisted in
+#  the DB and take precedence over this file on subsequent restarts.
+#
+#  vLLM engines run on the HOST — accessed from the container via
+#  host.containers.internal (Podman) or host-gateway (Docker).
+#  Adjust the api_base ports to match your running vLLM engines.
+# =============================================================================
+
+model_list:
+  # ── Models are managed dynamically by the LLMOps platform ──────────────────
+  # DO NOT add static model entries here — the platform API manages LiteLLM
+  # models via POST /v1/deployments/sync which adds/removes DB-backed entries.
+  # Static entries here create duplicate "Config Model" rows in the LiteLLM UI
+  # that cannot be deleted and may conflict with dynamically managed models.
+  #
+  # To register a new model: use the LLMOps Admin Console → Models → Register,
+  # approve it, start a vLLM engine, then Deployments → Sync Now.
+  #
+  # Example (commented out — use the platform instead):
+  # - model_name: qwen-0.5b
+  #   litellm_params:
+  #     model:    openai/qwen-0.5b          # must match --served-model-name
+  #     api_base: http://host.containers.internal:9000/v1
+  #     api_key:  fake-key
+
+litellm_settings:
+  # Forward all requests via LiteLLM callbacks so usage is tracked
+  success_callback: []
+  failure_callback: []
+  # Request timeout in seconds
+  request_timeout: 120
+
+general_settings:
+  # Master key — also set via LITELLM_MASTER_KEY env var (env var takes precedence)
+  master_key: ${LITELLM_MASTER_KEY}
+  # Store models created in the UI back into the database
+  store_model_in_db: true
